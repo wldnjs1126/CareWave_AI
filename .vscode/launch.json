@@ -1,0 +1,13 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Sensor Analysis",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "analysis.sensor_analysis",
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal"
+        }
+    ]
+}
