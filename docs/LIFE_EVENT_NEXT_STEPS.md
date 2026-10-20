@@ -146,3 +146,36 @@ python -m event_engine.db_backfill --subject-id 1 --sensor-id 1 --since "2026-10
 - 실제 운영은 본 도구가 아닌 앞으로 개발할 실시간 상태 엔진으로 연결할 예정입니다.
 
 현재 개발 단계: 데이터 검증 → 규칙 개선 → DB 저장 인터페이스 구성 완료(테스트 필요) → 검증된 자동 저장 활성화 → 낙상 모델 통합.
+
+## 2026-10-20: 실시간 sensor_raw 신규 데이터 미리보기
+
+\`event_engine/live_preview.py\`는 **NCP MySQL sensor_raw 조회 → 로컬 JSONL 상태 변화 기록**의 읽기 전용 프로그램입니다. \`life_event\` DB를 INSERT/UPDATE 하지 않습니다. 기존 센서 전송 API 서버의 코드를 수정하지 않습니다.
+
+먼저 알려진 실험 데이터 314행을 **한 번만 재생**합니다:
+
+\`\`\`cmd
+cd C:\CareWave_AI
+git pull --ff-only
+python -m unittest discover -s tests -v
+python -m event_engine.live_preview --subject-id 1 --sensor-id 1 --after-raw-id 193222 --until "2026-10-20 13:06:40" --batch-size 400 --max-polls 1 --out logs\carewave_history_preview.jsonl
+\`\`\`
+
+예상: 한 번의 폴링에서 314행(실험 기록이 변경되지 않았을 경우), 데이터 누락 14곳; 로컬 로그 파일 \`logs\carewave_history_preview.jsonl\` 생성. 사용자가 해당 명령을 다시 실행하면 JSONL에 결과가 **추가**됩니다.
+
+새 센서 데이터만 감시할 때:
+
+\`\`\`cmd
+python -m event_engine.live_preview --subject-id 1 --sensor-id 1 --poll-seconds 2 --out logs\carewave_live_preview.jsonl
+\`\`\`
+
+실행 즉시 해당 센서의 최신 \`raw_id\`에서 시작해, 이후 새로 DB에 저장된 행만 처리합니다. \`Ctrl+C\`로 종료합니다. 센서가 데이터 저장을 멈췄다면 새 데이터 0건 출력은 정상입니다.
+
+기능:
+- 각 이벤트의 시작 \`STARTED\`, 정상 종료 \`ENDED\`, 센서 데이터 누락으로 관측이 끊긴 상태 \`INTERRUPTED\`를 JSONL에 기록.
+- 5초 이내 누락 시 같은 확정 재실 상태만 유지. 움직임·수면·장시간 미움직임의 미관측 시간은 채우지 않음.
+- 잘못된 원시 데이터와 시간 역전/겹침은 데이터 품질 항목으로 기록하고 감지 근거로 사용하지 않음.
+- 실행이 끝나더라도 미종료 이벤트에 **가짜 종료 시각을 붙이지 않음**.
+- **체크포인트 복구는 아직 구현하지 않음.** 재시작할 때에는 기본적으로 최신 행부터 새로운 관측을 시작하며, 중단 시 이전 상태를 복원하지 않습니다.
+- 이벤트 감지 지연은 최소한 센서→NCP 저장 지연과 폴링 주기만큼 발생합니다. 기존에 관찰한 최대 약 1분 40초 지연은 이 프로그램만으로 해결되지 않습니다.
+- \`risk_level\`은 임시 정책값이고 \`FALL\` AI 경보는 비활성.
+- 본 코드의 이벤트 라벨은 **임상 검증되지 않은 후보**이며, 낙상 감시 장비의 안전 기능으로 사용하면 안 됩니다.
