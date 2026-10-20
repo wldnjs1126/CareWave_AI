@@ -62,5 +62,42 @@ class TestRuleReplay(unittest.TestCase):
                   zone="ROOM", speed=0.15, x=1.5, y=2.5)
         self.assertIn("NIGHT_EXIT", [e["event_type"] for e in engine.finish()])
 
+    def test_short_gap_bridges_confirmed_presence(self):
+        engine = ReplayEngine()
+        t = datetime(2026, 10, 20, 12)
+        self.feed(engine, t, 12)
+        self.feed(engine, t + timedelta(seconds=16), 11)
+        events = engine.finish()
+        self.assertEqual([event["event_type"] for event in events], ["PRESENCE"])
+        self.assertEqual(events[0]["bridged_gaps"], 1)
+
+    def test_short_gap_does_not_invent_absence(self):
+        engine = ReplayEngine()
+        t = datetime(2026, 10, 20, 12)
+        self.feed(engine, t, 12)
+        self.feed(engine, t + timedelta(seconds=16), 11, presence=False, speed=None)
+        events = engine.finish()
+        self.assertEqual([event["event_type"] for event in events],
+                         ["PRESENCE", "ABSENCE"])
+        self.assertEqual(events[0]["end_time"],
+                         (t + timedelta(seconds=12)).isoformat(sep=" "))
+
+    def test_long_gap_breaks_confirmed_presence(self):
+        engine = ReplayEngine()
+        t = datetime(2026, 10, 20, 12)
+        self.feed(engine, t, 12)
+        self.feed(engine, t + timedelta(seconds=20), 11)
+        self.assertEqual(
+            [event["event_type"] for event in engine.finish()],
+            ["PRESENCE", "PRESENCE"]
+        )
+
+    def test_pending_presence_cannot_count_missing_seconds(self):
+        engine = ReplayEngine()
+        t = datetime(2026, 10, 20, 12)
+        self.feed(engine, t, 6)
+        self.feed(engine, t + timedelta(seconds=10), 5)
+        self.assertEqual(engine.finish(), [])
+
 if __name__ == "__main__":
     unittest.main()
