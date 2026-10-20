@@ -137,7 +137,7 @@ class LivePreview:
 
     def process(self, sample: Sample) -> list[dict]:
         previous = self.last_sample
-        if previous is not None and sample.start < previous.end:
+        if previous is not None and (previous.end - sample.start).total_seconds() > 0.25:
             # Do not use unordered/overlapping observations for state tracking.
             self.counts["out_of_order"] += 1
             return [self._quality_record("overlapping_or_old_window", sample.raw_id)]
