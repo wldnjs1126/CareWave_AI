@@ -20,6 +20,7 @@ BED_SECONDS = 10
 MOVE_SECONDS = 3
 MOVE_SPEED = 0.10
 MOVE_DISPLACEMENT = 0.30
+MOVEMENT_STOP_SECONDS = 5  # initial tuning, requires independent validation
 STILL_SPEED = 0.10
 INACTIVITY_SECONDS = 30 * 60
 SLEEP_SECONDS = 20 * 60
@@ -98,6 +99,9 @@ class TrackState:
     inactivity_start: datetime | None = None
     bed_confirmed: bool = False
     skipped_gaps: int = 0
+    movement_quiet_start: datetime | None = None
+    movement_quiet_seconds: float = 0
+    last_movement_end: datetime | None = None
 
 class ReplayEngine:
     """Conservative candidate detector, not a validated medical event engine."""
@@ -118,6 +122,8 @@ class ReplayEngine:
         if event is not None:
             event.end_time = max(at, event.start_time)
             event.close_reason = reason
+            if kind == "MOVEMENT":
+                state.last_movement_end = event.end_time
 
     def _reset_on_gap(self, state: TrackState, next_sample: Sample, gap: float):
         """Treat unobserved time as UNKNOWN, never as absence or inactivity.
@@ -153,6 +159,8 @@ class ReplayEngine:
             ABSENCE_SECONDS if bridge else 0
         )
         state.movement_window.clear()
+        state.movement_quiet_start = None
+        state.movement_quiet_seconds = 0
         state.bed_start = None
         state.bed_confirmed = False
         state.sleep_start = None
@@ -210,9 +218,28 @@ class ReplayEngine:
                                           seq[-1].y - seq[0].y)
                 moving = displacement >= MOVE_DISPLACEMENT
         if moving:
-            self._start(state, "MOVEMENT", sample, state.movement_window[0].start)
-        else:
-            self._close(state, "MOVEMENT", sample.start, "movement_window_not_met")
+            began = state.movement_window[0].start
+            if state.last_movement_end is not None:
+                began = max(began, state.last_movement_end)
+            self._start(state, "MOVEMENT", sample, began)
+            state.movement_quiet_start = None
+            state.movement_quiet_seconds = 0
+        elif "MOVEMENT" in state.open_events:
+            # A momentarily invalid 3-second window is not automatically STOP.
+            # Require 5 consecutive observed seconds with no moving window.
+            if sample.speed is None or sample.x is None or sample.y is None:
+                self._close(state, "MOVEMENT", sample.start, "unknown_movement_data")
+                state.movement_quiet_start = None
+                state.movement_quiet_seconds = 0
+            else:
+                if state.movement_quiet_start is None:
+                    state.movement_quiet_start = sample.start
+                state.movement_quiet_seconds += elapsed
+                if state.movement_quiet_seconds >= MOVEMENT_STOP_SECONDS:
+                    self._close(state, "MOVEMENT", state.movement_quiet_start,
+                                "movement_stopped_after_observed_quiet")
+                    state.movement_quiet_start = None
+                    state.movement_quiet_seconds = 0
 
         # Bed can only be recognized if the real zone is BED.
         in_bed = sample.zone == "BED"
