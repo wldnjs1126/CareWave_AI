@@ -120,3 +120,29 @@ python -m scripts.check_life_event_write_conflicts --subject-id 1 --sensor-id 1 
 - `check_life_event_write_conflicts.py`는 현재 실험시간대 이벤트와 더 오래된 미종료 이벤트를 **별도로 SELECT**하며 결코 수정하지 않습니다.
 - 이 점검으로 다른 프로세스가 동시에 기록 중인지 판별할 수 없습니다. 실제 writer 도입 전 운영자 확인이 필요합니다.
 - `BED_STAY`, `SLEEP`, `NIGHT_EXIT`의 실제 침대 실험은 아직 진행하지 않았고 `FALL` 모델도 미검증입니다.
+
+## 2026-10-20: 완료 이벤트의 선택적 DB 저장 준비
+
+\`event_engine/db_backfill.py\`는 **과거 수집 구간**에서 확정된 완료 이벤트만 저장 대상으로 검토합니다.
+
+일반 실행은 DB **SELECT만 수행하는 미리보기**입니다.
+\`\`\`cmd
+cd C:\CareWave_AI
+git pull --ff-only
+python -m unittest discover -s tests -v
+python -m event_engine.db_backfill --subject-id 1 --sensor-id 1 --since "2026-10-20 13:00:30" --until "2026-10-20 13:06:40"
+\`\`\`
+
+안전 장치:
+- \`end_time IS NULL\`인 이벤트는 저장 대상에서 제외(실험 종료가 이벤트 종료를 뜻하지 않음).
+- \`sensor_data_gap\`, \`unknown_movement_data\` 때문에 종료된 후보는 제외.
+- \`FALL\`은 학습·검증 완료 전 금지.
+- 위험 등급은 \`risk_policy.py\`의 임시 운영 규칙만 사용.
+- 실제 저장 시에도 \`evidence\`에는 \`PROVISIONAL_NOT_CLINICALLY_VALIDATED\`로 표시하고 confidence는 NULL.
+- 저장 기능은 **기본 비활성**이고 단일 이벤트 종류, 예상 건수 일치, 명시 확인 문자열을 모두 입력해야 사용 가능.
+- 동일 이벤트를 다시 넣지 않도록 정확한 식별값을 비교하고 불일치 시 전체 트랜잭션 중단. 하지만 다른 writer의 동시 쓰기를 DB 제약으로 막는 것은 **아직 구현되지 않음**.
+- 오래된 더미 데이터, 미종료 3개 이벤트는 변경하지 않음.
+- **이 실험의 MOVEMENT 후보에는 앉아 있을 때 오탐이 포함될 수 있음**. 사용자 및 개발팀 검토 전 \`--apply\` 사용하지 마세요.
+- 실제 운영은 본 도구가 아닌 앞으로 개발할 실시간 상태 엔진으로 연결할 예정입니다.
+
+현재 개발 단계: 데이터 검증 → 규칙 개선 → DB 저장 인터페이스 구성 완료(테스트 필요) → 검증된 자동 저장 활성화 → 낙상 모델 통합.
