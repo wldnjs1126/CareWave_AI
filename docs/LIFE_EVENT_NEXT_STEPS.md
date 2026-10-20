@@ -74,3 +74,23 @@ python -m event_engine.rule_replay ai_model\experiments\sensor_raw_validation_01
 ```
 
 **주의**: 지금 샘플 CSV의 `zone`은 `ROOM`이어서 `BED_STAY`, `SLEEP`, `NIGHT_EXIT`의 실제 검증이 불가능합니다. 좌표계/침대 분류 구현이 선행되어야 합니다. `FALL`은 검증된 낙상 모델이 없어 비활성화된 상태입니다.
+
+## 2026-10-20: DB 기반 읽기 전용 이벤트 미리보기
+
+실제 NCP MySQL `sensor_raw`를 읽어 CSV와 동일한 후보 이벤트 판별을 수행합니다.
+
+```cmd
+cd C:\CareWave_AI
+git pull --ff-only
+python -m unittest discover -s tests -v
+python -m event_engine.db_replay --subject-id 1 --sensor-id 1 --since "2026-10-20 13:00:30" --until "2026-10-20 13:06:40"
+```
+
+- `--since`와 `--until`은 KST의 DB DATETIME 기준; 데이터가 없는 구간에는 이벤트도 나오지 않습니다.
+- 대상자, 센서, 시간 범위를 **모두** 입력해야 합니다.
+- DB에서는 `sensor_raw`에 대해 **SELECT만** 합니다. `life_event`를 읽거나 변경하지 않습니다.
+- 결과는 로컬 `carewave_db_event_preview.json`에 생성됩니다.
+- 최대 5,000행을 기본으로 허용하며 초과할 경우 분석을 중단합니다. `--max-rows`로 조절 가능합니다.
+- 실제 기존 더미 기록은 수정되지 않습니다.
+- `sensor_raw.presence`는 이미 서버가 추론한 재실 상태입니다. 시뮬레이터와 실제 대상자 데이터를 혼동하지 않도록 입력 시간대와 ID를 확인해야 합니다.
+- DB에 자동 쓰기는 **다음 단계**이며, 다른 이벤트 생성 프로세스 존재 여부를 확인하고 추가 테스트를 마친 뒤 별도로 활성화합니다.
