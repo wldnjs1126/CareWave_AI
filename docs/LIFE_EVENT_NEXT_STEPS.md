@@ -1,0 +1,59 @@
+# CareWave life_event 정리 (초기 단계)
+
+이 브랜치는 **기존 실시간 센서 서비스와 DB를 변경하지 않고**, 새로운 이벤트 저장 계층을 준비합니다.
+
+## 현재 확인한 운영 상태
+
+- `life_event` 기존 종류: `PRESENCE`, `MOVEMENT`, `BED_STAY`, `SLEEP`, `ABSENCE`, `NIGHT_EXIT`, `INACTIVITY`
+- 합계 439건 (2026-10-20 사용자 HeidiSQL 조회 결과)
+- `FALL`은 학습/검증된 데이터 또는 이벤트가 아직 확인되지 않음
+- 7개 **감지 범주**이지만 `PRESENCE`와 `ABSENCE`를 분리하므로 event_type은 총 8개
+- `risk_level`은 임시 운영정책: 정상/관찰/주의/위험. AI 예측값이 아님.
+
+## 제공 파일
+
+| 파일 | 목적 |
+|---|---|
+| `event_engine/risk_policy.py` | 8개 event_type -> 4개 위험 등급 |
+| `database/life_event_repository.py` | 이벤트 시작/종료 DB 함수 (아직 자동 호출하지 않음) |
+| `scripts/check_life_event_ready.py` | 조회만 수행하는 DB 상태 검사 |
+| `sql/01_add_life_event_risk_level.sql` | 수동, 1회용 컬럼 추가 안내 |
+| `sql/02_backfill_life_event_risk_level.sql` | 선택적 과거 데이터 등급 지정 |
+| `tests/test_risk_policy.py` | 순수 Python 테스트 |
+
+**기존** `database/db_storage.py`는 이전 시뮬레이터용이므로 그대로 두었습니다.
+
+## 실행 순서 (Windows / VS Code)
+
+1. HeidiSQL에서 `SHOW COLUMNS FROM life_event;` 실행하여 `risk_level` 존재 여부 확인.
+2. 없으면 `sql/01_add_life_event_risk_level.sql`의 ALTER 문을 **한 번만** 수동 실행.
+3. 선택적으로 과거 이벤트에 적용할 정책을 확인하고 `sql/02_backfill_life_event_risk_level.sql` 사용.
+4. 프로젝트 루트(`C:\CareWave_AI`)에서:
+
+```powershell
+conda activate carewave
+python -m unittest discover -s tests -v
+python -m scripts.check_life_event_ready
+```
+
+스키마 점검 도구는 DB를 **변경하지 않습니다**. `SQLAlchemy`, `PyMySQL`, `python-dotenv`가 없는 경우 해당 패키지를 설치합니다. 기존 `.env`의 DB_HOST/PORT/USER/PASSWORD/NAME 설정을 사용합니다. `.env`는 Git에 업로드하지 않습니다.
+
+## 실시간 연결 전 필수 확인
+
+- 저장 계층은 현재 **비활성**입니다. 이 브랜치만 적용해도 새 이벤트가 자동 생성되지는 않습니다.
+- `sensor_raw.presence`는 현재 서버가 추론한 **재실 상태**입니다. 순간 타깃 감지와 혼동하지 마세요.
+- 실험 데이터에서 **4초 누락 구간**이 반복 발견되었습니다. 누락을 '부재'나 '미움직임'으로 간주하면 안 됩니다.
+- 위치/높이의 물리적 의미와 실제 방/침대/출입구 좌표를 검증해야 합니다.
+- 기존 `life_event`에 쓰는 프로그램이 있는지 먼저 확인하여 **이중 저장을 막아야 합니다**.
+- `start_event`는 열린 이벤트를 조회해 재사용하지만 DB 수준의 동시성 유일성까지 보장하지 않습니다. **단일 writer**로 검증한 뒤 운영해야 합니다.
+- `detect_at`, `start_time`, `end_time`은 동일한 한국시간(KST), timezone 없는 `datetime`으로 전달합니다.
+- `confidence`는 실제 판단 근거가 있을 때만 사용하며, 모델이 없으면 임의 확률을 넣지 않습니다.
+- 낙상은 아직 안전하게 검증되지 않았으며 운영 의료 알림으로 사용하지 않습니다.
+
+## 다음 개발 목표
+
+1. `CareWave_sensor` 기존 이벤트 저장 프로세스와 중복 여부 및 4초 누락 원인 확인
+2. `sensor_raw` 1초 집계 + 연속 3초 분석(낙상은 원본 고속 스트림 필요성 검증)
+3. 7종 이벤트 detector에 데이터 품질/상태 전이/종료 로직 구현
+4. 독립된 테스트 시나리오, 재시작 복구, 중복 방지 검증
+5. 공개 낙상 자료와 실제 CareWave 특징을 정렬한 Random Forest 학습 및 검증 후 통합
