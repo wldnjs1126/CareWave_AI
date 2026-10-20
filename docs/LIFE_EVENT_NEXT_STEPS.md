@@ -57,3 +57,20 @@ python -m scripts.check_life_event_ready
 3. 7종 이벤트 detector에 데이터 품질/상태 전이/종료 로직 구현
 4. 독립된 테스트 시나리오, 재시작 복구, 중복 방지 검증
 5. 공개 낙상 자료와 실제 CareWave 특징을 정렬한 Random Forest 학습 및 검증 후 통합
+
+## 2026-10-20: CSV 누락 구간 보호 및 과거 더미데이터 분리
+
+- `rule_replay.py`: 관측 전후의 **확정된 동일 재실 상태**만 최대 5초 누락 구간에 걸쳐 하나의 에피소드로 보존합니다. 누락 시간은 10초 감지·움직임·수면·미움직임의 연속 시간에 계산하지 않습니다.
+- `sensor_raw_validation_01.csv` (322행) 재분석: 4초 누락 14곳, 재실 후보 14건 → 1건, 움직임 후보 19건 그대로, 전체 후보 20건. 5초 연결은 **일시적인 보호 규칙**일 뿐 센서 데이터 누락의 근본 원인을 수정하지 않습니다.
+- `database/life_event_repository.py`의 `start_event()`에는 `session_started_at` 필수가 추가되었습니다. 동일 세션의 중복 진행 이벤트는 차단하고, 이전 세션의 미종료 **더미데이터는 재사용하지 않습니다**. 그러나 DB의 동시 writer 방지 유일성 제약은 아직 없으므로 단일 writer에서만 사용해야 합니다.
+- 모든 새 파일은 기본적으로 실행되거나 DB에 쓰이지 않습니다. `python -m event_engine.rule_replay <CSV 경로>`는 **JSON 파일만 출력**합니다.
+
+실행:
+```powershell
+cd C:\CareWave_AI
+git pull --ff-only
+python -m unittest discover -s tests -v
+python -m event_engine.rule_replay ai_model\experiments\sensor_raw_validation_01.csv
+```
+
+**주의**: 지금 샘플 CSV의 `zone`은 `ROOM`이어서 `BED_STAY`, `SLEEP`, `NIGHT_EXIT`의 실제 검증이 불가능합니다. 좌표계/침대 분류 구현이 선행되어야 합니다. `FALL`은 검증된 낙상 모델이 없어 비활성화된 상태입니다.
