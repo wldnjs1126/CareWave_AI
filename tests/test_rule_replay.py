@@ -99,5 +99,35 @@ class TestRuleReplay(unittest.TestCase):
         self.feed(engine, t + timedelta(seconds=10), 5)
         self.assertEqual(engine.finish(), [])
 
+    def test_movement_short_invalid_window_is_not_immediate_stop(self):
+        engine = ReplayEngine()
+        t = datetime(2026, 10, 20, 12)
+        for i in range(6):
+            now = t + timedelta(seconds=i)
+            engine.add(Sample(now, now + timedelta(seconds=1), 1, 1,
+                              True, "ROOM", i * 0.2, 1.0, 0.2))
+        for i in range(2):
+            now = t + timedelta(seconds=6 + i)
+            engine.add(Sample(now, now + timedelta(seconds=1), 1, 1,
+                              True, "ROOM", 1.0, 1.0, 0.02))
+        events = [e for e in engine.finish() if e["event_type"] == "MOVEMENT"]
+        self.assertEqual(len(events), 1)
+        self.assertIsNone(events[0]["end_time"])
+
+    def test_movement_stops_after_five_observed_quiet_seconds(self):
+        engine = ReplayEngine()
+        t = datetime(2026, 10, 20, 12)
+        for i in range(6):
+            now = t + timedelta(seconds=i)
+            engine.add(Sample(now, now + timedelta(seconds=1), 1, 1,
+                              True, "ROOM", i * 0.2, 1.0, 0.2))
+        for i in range(7):
+            now = t + timedelta(seconds=6 + i)
+            engine.add(Sample(now, now + timedelta(seconds=1), 1, 1,
+                              True, "ROOM", 1.0, 1.0, 0.02))
+        movement = [e for e in engine.finish() if e["event_type"] == "MOVEMENT"]
+        self.assertEqual(len(movement), 1)
+        self.assertIsNotNone(movement[0]["end_time"])
+
 if __name__ == "__main__":
     unittest.main()
