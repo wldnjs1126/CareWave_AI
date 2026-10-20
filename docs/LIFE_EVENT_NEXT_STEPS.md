@@ -104,3 +104,19 @@ python -m event_engine.db_replay --subject-id 1 --sensor-id 1 --since "2026-10-2
 - 여전히 움직임 결과는 **후보**입니다. 앉은 상태의 오탐이 있으므로 DB에 그대로 저장하지 않습니다. 미래 구간에서도 동일한 변화가 나타나는지 독립 평가가 필요합니다.
 - 실제 테스트는 서 있기 → 걷기 → 앉기이며 **침대 체류 데이터가 아닙니다**. 따라서 zone이 전부 ROOM인 것은 이 실험에선 자연스러울 수 있습니다. BED 감지는 별도 침대 실험에서 검증합니다.
 - 이벤트 저장 활성화에 앞서 기존 저장 프로세스와 충돌 여부, 더미데이터 구분, 미종료 이벤트 복구, 모델 오탐을 검증합니다.
+
+## 이어서 진행: 22개 테스트 및 DB 저장 충돌 사전 점검
+
+```cmd
+cd C:\CareWave_AI
+git pull --ff-only
+python -m unittest discover -s tests -v
+python -m event_engine.db_replay --subject-id 1 --sensor-id 1 --since "2026-10-20 13:00:30" --until "2026-10-20 13:06:40"
+python -m scripts.check_life_event_write_conflicts --subject-id 1 --sensor-id 1 --since "2026-10-20 13:00:30" --until "2026-10-20 13:06:40"
+```
+
+- 기대 단위 테스트: 22개.
+- 기존 314개 기록을 이용한 잠정 MOVEMENT 종료 완충 적용 결과: 18건에서 8건. 걷기 6건, 앉기 2건 오탐 의심. 실험 외 데이터에서 재검증 전 자동 저장 금지.
+- `check_life_event_write_conflicts.py`는 현재 실험시간대 이벤트와 더 오래된 미종료 이벤트를 **별도로 SELECT**하며 결코 수정하지 않습니다.
+- 이 점검으로 다른 프로세스가 동시에 기록 중인지 판별할 수 없습니다. 실제 writer 도입 전 운영자 확인이 필요합니다.
+- `BED_STAY`, `SLEEP`, `NIGHT_EXIT`의 실제 침대 실험은 아직 진행하지 않았고 `FALL` 모델도 미검증입니다.
