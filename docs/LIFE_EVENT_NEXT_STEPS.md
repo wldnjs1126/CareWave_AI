@@ -179,3 +179,23 @@ python -m event_engine.live_preview --subject-id 1 --sensor-id 1 --poll-seconds 
 - 이벤트 감지 지연은 최소한 센서→NCP 저장 지연과 폴링 주기만큼 발생합니다. 기존에 관찰한 최대 약 1분 40초 지연은 이 프로그램만으로 해결되지 않습니다.
 - \`risk_level\`은 임시 정책값이고 \`FALL\` AI 경보는 비활성.
 - 본 코드의 이벤트 라벨은 **임상 검증되지 않은 후보**이며, 낙상 감시 장비의 안전 기능으로 사용하면 안 됩니다.
+
+## 2026-10-20: 반복적인 4초 데이터 공백의 원인 분석
+
+1차 CSV 322행의 14개 구간에서 4초씩 사라진 window_start 라벨이 있으며, gap 전후 raw_id는 1씩 증가하고 created_at은 대체로 2초만 차이 납니다. 평균 created_at 간격은 1.174초입니다. 서버는 HTTP 배치 하나에 1초를 할당한 뒤 내부 drift가 3초를 초과하면 실시간 서버 수신시각으로 재배치하는 로직을 사용합니다. **시각 부여 로직이 공백을 만들어낸 것일 가능성이 높고 네트워크 패킷 분실로 확정할 근거가 없습니다.** 원인 최종 판정은 ESP32 연속 frame_id와 서버 진단 로그를 함께 봐야 합니다.
+
+새로 추가한 읽기 전용 조회:
+```cmd
+cd C:\CareWave_AI
+git pull --ff-only
+python -m unittest discover -s tests -v
+python -m scripts.diagnose_sensor_timeline --subject-id 1 --sensor-id 1 --since "2026-10-20 15:48:35" --until "2026-10-20 15:53:51"
+```
+
+센서 서버 레포의 진단용 브랜치 (운영 main에 자동 반영되지 않음):
+`diagnostic/sensor-batch-timeline-20261020`
+활성 설정: `CAREWAVE_BATCH_TIMELINE_DEBUG=1`; 백엔드 로그의 `CAREWAVE_BATCH_TIMELINE` 조회.
+
+**주의**: 1초 배치당 실제 수신 간격이 1.17초라면 3초 점프만 제거해도 참 시간이 틀어집니다. 원시 프레임 시각/송신 간격을 확인한 뒤 실제 1초 구간 기준으로 재집계해야 합니다.
+
+`presence=1`+NULL 위치/속도는 관측된 정지(속도=0)가 아니며 장시간 미움직임 증거가 아닙니다. 마지막 유효 좌표의 유지 및 화면 표시에는 별도의 `carried_forward`/유효시간을 표시해야 하고, sensor_raw의 원본 NULL을 0으로 바꾸면 안 됩니다.
