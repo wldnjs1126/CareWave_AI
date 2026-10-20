@@ -3,6 +3,7 @@
 WARNING:
 - This module does not detect events and does not run automatically.
 - Use a *single* event engine writer until DB-level uniqueness is designed.
+- session_started_at is mandatory to isolate fresh sensor runs from stale demo rows.
 - start_time and detect_at must be naive datetimes in the SAME KST clock basis
   used by sensor_raw.window_start; MySQL DATETIME has no timezone information.
 - Risk labels are temporary policy values, not model confidence.
@@ -21,13 +22,29 @@ from database.connection import engine
 from event_engine.risk_policy import risk_for_event
 
 
-FIND_OPEN_EVENT = text(
+FIND_EXACT_EVENT = text(
     """
     SELECT event_id
       FROM life_event
      WHERE subject_id = :subject_id
+       AND sensor_id <=> :sensor_id
+       AND event_type = :event_type
+       AND start_time = :start_time
+     ORDER BY event_id DESC
+     LIMIT 1
+     FOR UPDATE
+    """
+)
+
+FIND_SESSION_OPEN_EVENT = text(
+    """
+    SELECT event_id
+      FROM life_event
+     WHERE subject_id = :subject_id
+       AND sensor_id <=> :sensor_id
        AND event_type = :event_type
        AND end_time IS NULL
+       AND start_time >= :session_started_at
      ORDER BY event_id DESC
      LIMIT 1
      FOR UPDATE
@@ -69,13 +86,16 @@ def start_event(
     event_type: str,
     start_time: datetime,
     detect_at: datetime,
+    session_started_at: datetime,
     sensor_id: int | None = None,
     zone: str | None = None,
     confidence: float | None = None,
     evidence: dict[str, Any] | None = None,
 ) -> tuple[int, bool]:
-    """Insert an open event, or reuse an existing open event (single writer).
+    """Insert/reuse the exact episode; reject another open event in this session.
 
+    Historical open records before session_started_at are NOT reused.
+    Requires a single writer until a DB-level uniqueness constraint is added.
     Returns (event_id, created). Does not generate detection labels.
     """
     risk_level = risk_for_event(event_type)
@@ -83,6 +103,9 @@ def start_event(
         raise ValueError("subject_id must be a positive integer")
     _require_naive_datetime(start_time, "start_time")
     _require_naive_datetime(detect_at, "detect_at")
+    _require_naive_datetime(session_started_at, "session_started_at")
+    if session_started_at > start_time:
+        raise ValueError("session_started_at must not follow event start_time")
     if detect_at < start_time:
         raise ValueError("detect_at must not precede start_time")
     if confidence is not None and not 0 <= confidence <= 1:
@@ -104,15 +127,25 @@ def start_event(
         "confidence": confidence,
         "risk_level": risk_level,
         "evidence": evidence_json,
+        "session_started_at": session_started_at,
     }
 
     with engine.begin() as connection:
-        existing = connection.execute(
-            FIND_OPEN_EVENT, {"subject_id": subject_id, "event_type": event_type}
-        ).scalar_one_or_none()
-        if existing is not None:
-            return int(existing), False
+        # Idempotence for one exact event, regardless of whether it is still open.
+        exact = connection.execute(FIND_EXACT_EVENT, params).scalar_one_or_none()
+        if exact is not None:
+            return int(exact), False
 
+        # Do not conflate a new run with stale demo events from past dates.
+        # But fail closed if a different episode is still open in THIS session.
+        competing = connection.execute(
+            FIND_SESSION_OPEN_EVENT, params
+        ).scalar_one_or_none()
+        if competing is not None:
+            raise RuntimeError(
+                "Another open episode exists in this session for this "
+                "subject/sensor/event_type; close or inspect it before writing."
+            )
         result = connection.execute(INSERT_LIFE_EVENT, params)
         return int(result.lastrowid), True
 
