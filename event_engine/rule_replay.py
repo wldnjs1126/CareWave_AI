@@ -26,6 +26,7 @@ SLEEP_SECONDS = 20 * 60
 SLEEP_SPEED = 0.02
 SLEEP_DISTANCE = 0.15
 GAP_TOLERANCE_SECONDS = 0.25
+MAX_OCCUPANCY_GAP_BRIDGE_SECONDS = 5.0
 
 def _val(value: str | None) -> float | None:
     if value in (None, "", "\\N", "NULL", "None"):
@@ -62,6 +63,7 @@ class Event:
     zone: str | None
     end_time: datetime | None = None
     close_reason: str | None = None
+    bridged_gaps: int = 0
 
     def as_json(self) -> dict:
         return {
@@ -77,6 +79,7 @@ class Event:
             ),
             "zone": self.zone, "confidence": None,
             "source": "RULE_REPLAY_DRY_RUN",
+            "bridged_gaps": self.bridged_gaps,
             "close_reason": self.close_reason,
         }
 
@@ -116,22 +119,46 @@ class ReplayEngine:
             event.end_time = max(at, event.start_time)
             event.close_reason = reason
 
-    def _reset_on_gap(self, state: TrackState):
-        if state.previous is not None:
+    def _reset_on_gap(self, state: TrackState, next_sample: Sample, gap: float):
+        """Treat unobserved time as UNKNOWN, never as absence or inactivity.
+
+        A confirmed occupancy episode may be bridged across <=5s of missing
+        measurements only when both surrounding observed samples agree. No
+        unobserved second contributes to confirmation or stillness timers.
+        """
+        previous = state.previous
+        state.skipped_gaps += 1
+        old_kind = state.occupancy_confirmed
+        new_kind = "PRESENCE" if next_sample.presence else "ABSENCE"
+        bridge = (
+            previous is not None
+            and 0 < gap <= MAX_OCCUPANCY_GAP_BRIDGE_SECONDS
+            and previous.presence == next_sample.presence
+            and old_kind == new_kind
+            and old_kind in state.open_events
+        )
+        if previous is not None:
             for kind in list(state.open_events):
-                self._close(state, kind, state.previous.end, "sensor_data_gap")
-        state.previous = None
-        state.occupancy_condition = None
-        state.occupancy_streak_start = None
-        state.occupancy_streak_seconds = 0
-        state.occupancy_confirmed = None
+                if bridge and kind == new_kind:
+                    state.open_events[kind].bridged_gaps += 1
+                else:
+                    self._close(state, kind, previous.end, "sensor_data_gap")
+
+        # Short gap preserves only a CONFIRMED occupancy episode, nothing else.
+        state.occupancy_confirmed = new_kind if bridge else None
+        state.occupancy_condition = new_kind == "PRESENCE" if bridge else None
+        state.occupancy_streak_start = next_sample.start if bridge else None
+        state.occupancy_streak_seconds = (
+            PRESENCE_SECONDS if bridge and next_sample.presence else
+            ABSENCE_SECONDS if bridge else 0
+        )
         state.movement_window.clear()
         state.bed_start = None
         state.bed_confirmed = False
         state.sleep_start = None
         state.sleep_anchor = None
         state.inactivity_start = None
-        state.skipped_gaps += 1
+        state.previous = None
 
     def add(self, sample: Sample):
         key = (sample.subject_id, sample.sensor_id)
@@ -142,7 +169,7 @@ class ReplayEngine:
         if previous is not None:
             gap = (sample.start - previous.end).total_seconds()
             if abs(gap) > GAP_TOLERANCE_SECONDS:
-                self._reset_on_gap(state)
+                self._reset_on_gap(state, sample, gap)
 
         elapsed = (sample.end - sample.start).total_seconds()
         if sample.presence != state.occupancy_condition:
