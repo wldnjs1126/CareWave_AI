@@ -1,4 +1,5 @@
 import csv
+import os
 import math
 import time
 import threading
@@ -15,7 +16,25 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from network.realtime_sender import RealtimeSender
+# CSV 전용 시험: set SIMULATOR_OFFLINE=1 (CMD), 또는 $env:SIMULATOR_OFFLINE="1" (PowerShell)
+# 기본값은 기존 network.realtime_sender.RealtimeSender를 그대로 사용하여 API로 전송.
+if os.getenv("SIMULATOR_OFFLINE", "0") == "1":
+    class RealtimeSender:
+        api_url = "OFFLINE (CSV ONLY)"
+
+        def submit(self, frame):
+            pass
+
+        def close(self):
+            pass
+else:
+    try:
+        from network.realtime_sender import RealtimeSender
+    except ImportError as exc:
+        raise ImportError(
+            "실시간 전송용 network/realtime_sender.py가 필요합니다. "
+            "CSV만 시험하려면 SIMULATOR_OFFLINE=1을 설정하세요."
+        ) from exc
 
 
 # ============================================================
@@ -23,7 +42,7 @@ from network.realtime_sender import RealtimeSender
 #
 # 주요 기능
 # 1) 실제 컴퓨터 시간 datetime.now() 사용
-# 2) 10 FPS radar_frame.csv 저장
+# 2) 10 FPS radar_frame.csv 저장 (방 전역 좌표계, 천장 중앙 설치 가정)
 # 3) 상태 기반 랜덤 행동 생성
 # 4) 7종 이벤트 로그
 #    - FALL
@@ -69,11 +88,19 @@ NIGHT_END_HOUR = 6
 # 침대에서 나온 뒤 몇 분 이내의 부재를 야간이탈 후보로 볼지
 NIGHT_EXIT_BED_WINDOW_MINUTES = 15
 
-# 랜덤 시뮬레이션의 낙상 빈도.
-# 학습용 더미데이터라 실제 병동보다 높게 설정.
-# 0.03 = 행동 선택 시 약 3% 확률 수준
-FALL_WEIGHT_DAY = 0.03
-FALL_WEIGHT_NIGHT = 0.02
+# 낙상은 가끔만 선택. 확률은 매 행동 선택 시의 가중치이며 시간당 확률이 아님.
+FALL_WEIGHT_DAY = 0.006
+FALL_WEIGHT_NIGHT = 0.002
+FALL_COOLDOWN_SECONDS = 3 * 3600
+
+# 장시간 미움직임 테스트: 현재 Event Engine의 기본 기준(30분=1800초)을 넘도록 유지.
+# 임계값을 별도로 변경했다면 INACTIVITY_DURATION_MIN/MAX도 함께 변경할 것.
+INACTIVITY_DURATION_MIN = 1880
+INACTIVITY_DURATION_MAX = 2100
+
+# 실제 경과시간 1초에 센서 프레임 10개. 장시간 이벤트를 몇 분 안에 강제하지 않음.
+WALK_ROUNDS_MIN = 2
+WALK_ROUNDS_MAX = 4
 
 # 랜덤 seed.
 # None이면 실행할 때마다 다르게 생성됨.
@@ -84,35 +111,31 @@ RANDOM_SEED = None
 # 병실 / 센서
 # ============================================================
 
-# 병실 왼쪽 아래 모서리 상단 센서
-SENSOR_POSITION = np.array(
-    [0.15, 0.15, 2.30],
-    dtype=float
-)
+# 전역 좌표: 바닥 왼쪽 아래 (0,0,0), x=0~4, y=0~5, z=바닥 높이.
+# 실제 천장 정중앙 센서(예시): (2.0, 2.5, 2.7). 센서의 x/y/z가 이미
+# 이 방 좌표계로 변환되어 있다고 가정; FOV/차폐/포인트클라우드는 모사하지 않음.
+SENSOR_POSITION = np.array([2.0, 2.5, ROOM_HEIGHT], dtype=float)
 
-# 병실 내 주요 위치
+BED_X_MIN, BED_X_MAX = 0.6, 1.6
+BED_Y_MIN, BED_Y_MAX = 1.6, 3.7
+BED_CENTER = np.array([1.1, 2.65], dtype=float)
+MATTRESS_Z = 0.65
+LYING_Z = 0.90      # 누운 사람 대표 중심 (0.80~1.00m)
+SLEEPING_Z = 0.87
+SITTING_Z = 1.00
+STANDING_Z = 1.32
+
 ZONES = {
-    "bed": np.array(
-        [1.10, 1.60],
-        dtype=float
-    ),
-    "bed_side": np.array(
-        [1.80, 1.80],
-        dtype=float
-    ),
-    "center": np.array(
-        [2.00, 2.80],
-        dtype=float
-    ),
-    "door": np.array(
-        [3.45, 4.55],
-        dtype=float
-    ),
-    "bathroom": np.array(
-        [3.30, 3.20],
-        dtype=float
-    ),
+    "bed": BED_CENTER.copy(),
+    "bed_side": np.array([1.95, 2.65], dtype=float),
+    "center": np.array([2.65, 2.35], dtype=float),
+    "door": np.array([3.5, 4.65], dtype=float),
+    "bathroom": np.array([3.35, 3.6], dtype=float),
 }
+
+
+def in_bed_zone(x, y):
+    return BED_X_MIN <= x <= BED_X_MAX and BED_Y_MIN <= y <= BED_Y_MAX
 
 
 # ============================================================
@@ -566,7 +589,8 @@ class VirtualPatient:
             ZONES["bed_side"][1]
         )
 
-        self.z = 1.20
+        self.z = STANDING_Z
+        self.sitting_on_bed = False
 
         # 이전 위치
         self.prev_x = self.x
@@ -630,7 +654,7 @@ class VirtualPatient:
             np.clip(
                 self.z,
                 0.15,
-                1.40
+                1.55
             )
         )
 
@@ -695,15 +719,12 @@ class VirtualPatient:
         self.state = "standing"
 
 
-    def set_sitting(self):
-
+    def set_sitting(self, on_bed=False):
         self.presence = True
-
         self.target = None
         self.target_name = None
-
+        self.sitting_on_bed = on_bed
         self.state = "sitting"
-
 
     def set_lying(self):
 
@@ -765,7 +786,7 @@ class VirtualPatient:
             ZONES["door"][1]
         )
 
-        self.z = 1.20
+        self.z = STANDING_Z
 
         self.state = "standing"
 
@@ -919,28 +940,11 @@ class VirtualPatient:
     # ========================================================
 
     def update_standing(self):
-
         self.phase += DT
-
-        # 작은 자세 흔들림
-        self.x += (
-            math.sin(
-                self.phase * 0.8
-            )
-            * 0.0006
-        )
-
-        self.y += (
-            math.cos(
-                self.phase * 0.6
-            )
-            * 0.0005
-        )
-
-        self.z += (
-            1.20 - self.z
-        ) * 0.12
-
+        # 제자리 자세 변화는 작게; 위치 오차는 get_radar_frame에서 추가됨.
+        self.x += math.sin(self.phase * 0.8) * 0.0006
+        self.y += math.cos(self.phase * 0.6) * 0.0005
+        self.z += (STANDING_Z - self.z) * 0.12
 
     def update_walking(self):
 
@@ -1015,7 +1019,7 @@ class VirtualPatient:
         self.phase += DT
 
         self.z = (
-            1.20
+            STANDING_Z
             + 0.018
             * math.sin(
                 self.phase
@@ -1029,63 +1033,19 @@ class VirtualPatient:
 
 
     def update_sitting(self):
-
-        self.z += (
-            0.82 - self.z
-        ) * 0.16
-
+        target_z = 1.08 if self.sitting_on_bed else SITTING_Z
+        self.z += (target_z - self.z) * 0.16
 
     def update_lying(self):
-
-        self.x += (
-            float(
-                ZONES["bed"][0]
-            )
-            - self.x
-        ) * 0.08
-
-        self.y += (
-            float(
-                ZONES["bed"][1]
-            )
-            - self.y
-        ) * 0.08
-
-        self.z += (
-            0.53 - self.z
-        ) * 0.12
-
+        self.x += (ZONES["bed"][0] - self.x) * 0.08
+        self.y += (ZONES["bed"][1] - self.y) * 0.08
+        self.z += (LYING_Z - self.z) * 0.12
 
     def update_sleeping(self):
-
         self.phase += DT
-
-        self.x += (
-            float(
-                ZONES["bed"][0]
-            )
-            - self.x
-        ) * 0.10
-
-        self.y += (
-            float(
-                ZONES["bed"][1]
-            )
-            - self.y
-        ) * 0.10
-
-        # 호흡 수준의 미세 변화
-        self.z = (
-            0.53
-            + 0.006
-            * math.sin(
-                self.phase
-                * 2
-                * math.pi
-                * 0.25
-            )
-        )
-
+        self.x += (ZONES["bed"][0] - self.x) * 0.10
+        self.y += (ZONES["bed"][1] - self.y) * 0.10
+        self.z = SLEEPING_Z + 0.006 * math.sin(self.phase * 2 * math.pi * 0.25)
 
     def update_inactivity(self):
 
@@ -1186,14 +1146,14 @@ class VirtualPatient:
     def update_recovering(self):
 
         self.z += (
-            1.20 - self.z
+            STANDING_Z - self.z
         ) * 0.07
 
         if abs(
-            self.z - 1.20
+            self.z - STANDING_Z
         ) < 0.02:
 
-            self.z = 1.20
+            self.z = STANDING_Z
 
             self.state = "standing"
 
@@ -1553,6 +1513,9 @@ class RadarSimulator:
 
         # 야간이탈 파생에 사용
         self.last_bed_exit_at = None
+        self.last_random_fall_at = None
+        self.auto_steps = 0
+        self.actions_since_inactivity = 3
 
 
     # ========================================================
@@ -1602,14 +1565,7 @@ class RadarSimulator:
                 "sensor_id":
                     SENSOR_ID,
 
-                "subject_id":
-                    (
-                        SUBJECT_ID
-                        if data[
-                            "presence"
-                        ]
-                        else ""
-                    ),
+                "subject_id": SUBJECT_ID,
 
                 **data,
 
@@ -1849,7 +1805,7 @@ class RadarSimulator:
 
         with self.state_lock:
 
-            self.patient.set_sitting()
+            self.patient.set_sitting(on_bed=on_bed)
 
 
     def lie(self):
@@ -2080,667 +2036,224 @@ class RadarSimulator:
 
 
     def wake_up_sequence(self):
-
-        """
-        수면 / 침대 상태에서
-        자연스럽게 기상.
-        """
-
-        self.events.end(
-            "SLEEP"
-        )
-
-        # 침대에서 잠깐 앉음
-        self.sit(
-            on_bed=True
-        )
-
-        if not self.scenario_wait(
-            self.random_seconds(
-                15,
-                60
-            )
-        ):
-
-            return False
-
-        # 기립
+        """침대에서는 앉았다 기립, 의자에서 앉았다면 바로 기립."""
+        self.events.end("SLEEP")
+        with self.state_lock:
+            current = self.patient.state
+        if current in {"sleeping", "lying"}:
+            self.sit(on_bed=True)
+            if not self.scenario_wait(self.random_seconds(8, 25)):
+                return False
         self.stand()
-
-        return self.scenario_wait(
-            self.random_seconds(
-                10,
-                40
-            )
-        )
-
+        return self.scenario_wait(self.random_seconds(4, 12))
 
     def random_walk_action(self):
-
-        targets = [
-            "center",
-            "bed_side",
-            "bathroom"
-        ]
-
-        target = str(
-            self.rng.choice(
-                targets
-            )
-        )
-
-        print(
-            f"[AUTO] 병실 이동 -> "
-            f"{target}"
-        )
-
-        self.walk(
-            target
-        )
-
-        self.wait_for_state(
-            "standing",
-            timeout=30
-        )
-
-        return self.scenario_wait(
-            self.random_seconds(
-                30,
-                180
-            )
-        )
-
-
-    def bathroom_action(self):
-
-        print(
-            "[AUTO] 화장실 방향 이동"
-        )
-
-        # 침대/수면 중이면 먼저 기상
+        """한 행동에서 여러 목적지까지 걸어 움직임 이벤트를 반복 생성."""
+        print("[AUTO] 활발한 병실 이동")
         with self.state_lock:
-
-            state = (
-                self.patient.state
-            )
-
-        if state in {
-            "sleeping",
-            "lying",
-            "sitting"
-        }:
-
+            current_state = self.patient.state
+        if current_state in {"sleeping", "lying", "sitting"}:
             if not self.wake_up_sequence():
                 return
-
-        self.walk(
-            "bathroom"
-        )
-
-        self.wait_for_state(
-            "standing",
-            timeout=30
-        )
-
-        if not self.auto_active():
-            return
-
-        # 화장실 체류는 움직임이 적은 상태
-        self.inactivity(
-            "BATHROOM_STAY"
-        )
-
-        if not self.scenario_wait(
-            self.random_seconds(
-                120,
-                420
-            )
-        ):
-
-            return
-
-        self.events.end(
-            "INACTIVITY"
-        )
-
-        self.stand()
-
-
-    def bed_rest_action(self):
-
-        print(
-            "[AUTO] 침대 휴식"
-        )
-
-        # 침대 근처로 이동
-        with self.state_lock:
-
-            state = (
-                self.patient.state
-            )
-
-        if state not in {
-            "lying",
-            "sleeping"
-        }:
-
-            self.walk(
-                "bed_side"
-            )
-
-            self.wait_for_state(
-                "standing",
-                timeout=30
-            )
-
-        if not self.auto_active():
-            return
-
-        self.lie()
-
-        self.scenario_wait(
-            self.random_seconds(
-                180,
-                900
-            )
-        )
-
-
-    def sleep_action(self):
-
-        period = day_period()
-
-        print(
-            f"[AUTO] 수면 시작 "
-            f"(현재 구간={period})"
-        )
-
-        with self.state_lock:
-
-            state = (
-                self.patient.state
-            )
-
-        if state not in {
-            "lying",
-            "sleeping"
-        }:
-
-            self.walk(
-                "bed_side"
-            )
-
-            self.wait_for_state(
-                "standing",
-                timeout=30
-            )
-
+        targets = ["center", "bed_side", "bathroom", "door"]
+        rounds = int(self.rng.integers(WALK_ROUNDS_MIN, WALK_ROUNDS_MAX + 1))
+        for _ in range(rounds):
             if not self.auto_active():
                 return
-
-            self.lie()
-
-            if not self.scenario_wait(
-                self.random_seconds(
-                    20,
-                    60
-                )
-            ):
-
+            with self.state_lock:
+                pos = np.array([self.patient.x, self.patient.y])
+            far = [t for t in targets if np.linalg.norm(ZONES[t] - pos) >= 1.2]
+            target = str(self.rng.choice(far or targets))
+            print(f"[AUTO] 병실 이동 -> {target}")
+            self.walk(target)
+            if not self.wait_for_state("standing", timeout=30):
+                return
+            if not self.scenario_wait(self.random_seconds(5, 22)):
                 return
 
-        self.sleep()
-
-        # 실제 시각대에 따라 수면 길이를 다르게
-        if period == "night":
-
-            duration = (
-                self.random_seconds(
-                    900,
-                    2700
-                )
-            )
-
-        elif period == "evening":
-
-            duration = (
-                self.random_seconds(
-                    600,
-                    1800
-                )
-            )
-
-        else:
-
-            # 낮잠
-            duration = (
-                self.random_seconds(
-                    300,
-                    1200
-                )
-            )
-
-        self.scenario_wait(
-            duration
-        )
-
-
-    def inactivity_action(self):
-
-        print(
-            "[AUTO] 장시간 미움직임"
-        )
-
-        # 서 있는 상태 또는 앉아 있는 상태에서 시작
+    def bathroom_action(self):
+        print("[AUTO] 화장실 방향 이동 (짧은 휴식은 LONG_INACTIVITY 라벨 아님)")
         with self.state_lock:
-
-            state = (
-                self.patient.state
-            )
-
-        if state in {
-            "sleeping",
-            "lying"
-        }:
-
+            state = self.patient.state
+        if state in {"sleeping", "lying", "sitting"}:
             if not self.wake_up_sequence():
                 return
-
-        self.inactivity(
-            "RANDOM_INACTIVITY"
-        )
-
-        if not self.scenario_wait(
-            self.random_seconds(
-                180,
-                720
-            )
-        ):
-
+        self.walk("bathroom")
+        if not self.wait_for_state("standing", timeout=30):
             return
-
-        self.events.end(
-            "INACTIVITY"
-        )
-
+        if not self.auto_active():
+            return
+        self.sit(on_bed=False)
+        if not self.scenario_wait(self.random_seconds(45, 120)):
+            return
         self.stand()
 
+    def bed_rest_action(self):
+        print("[AUTO] 침대 휴식")
+        with self.state_lock:
+            state = self.patient.state
+        if state not in {"lying", "sleeping"}:
+            self.walk("bed")
+            if not self.wait_for_state("standing", timeout=30):
+                return
+        if not self.auto_active():
+            return
+        self.lie()
+        self.scenario_wait(self.random_seconds(80, 240))
+
+    def sleep_action(self):
+        period = day_period()
+        print(f"[AUTO] 수면 시작 (시간대={period})")
+        with self.state_lock:
+            state = self.patient.state
+        if state not in {"lying", "sleeping"}:
+            self.walk("bed")
+            if not self.wait_for_state("standing", timeout=30):
+                return
+            if not self.auto_active():
+                return
+            self.lie()
+            if not self.scenario_wait(self.random_seconds(12, 30)):
+                return
+        self.sleep()
+        if period == "night":
+            duration = self.random_seconds(3600, 21600)  # 15분 수면 기준 충족
+        elif period == "evening":
+            duration = self.random_seconds(1800, 3600)
+        else:
+            duration = self.random_seconds(920, 1800)
+        self.scenario_wait(duration)
+
+    def inactivity_action(self):
+        print("[AUTO] 장시간 미움직임 (Event Engine 30분 기준 초과)")
+        with self.state_lock:
+            state = self.patient.state
+            on_bed = in_bed_zone(self.patient.x, self.patient.y)
+        if state in {"sleeping", "lying", "sitting"}:
+            if not self.wake_up_sequence():
+                return
+        # LONG_INACTIVITY 엔진은 침대 밖에서만 검출. 먼저 실제 좌표를 이동시킴.
+        if on_bed or self.events.is_active("BED_STAY"):
+            self.walk("bed_side")
+            if not self.wait_for_state("standing", timeout=30):
+                return
+            if not self.scenario_wait(self.random_seconds(5, 12)):
+                return
+        with self.state_lock:
+            assert not in_bed_zone(self.patient.x, self.patient.y), "침대 밖 좌표 이동 실패"
+        self.inactivity("LONG_INACTIVITY_TEST")
+        duration = self.random_seconds(INACTIVITY_DURATION_MIN, INACTIVITY_DURATION_MAX)
+        print(f"[AUTO] 저움직임 {duration/60:.1f}분 유지 예정 (실제 경과시간)")
+        if not self.scenario_wait(duration):
+            return
+        self.events.end("INACTIVITY")
+        self.stand()
 
     def sit_rest_action(self):
-
-        print(
-            "[AUTO] 앉아서 휴식"
-        )
-
+        print("[AUTO] 짧게 앉아서 휴식")
         with self.state_lock:
-
-            state = (
-                self.patient.state
-            )
-
-        if state in {
-            "sleeping",
-            "lying"
-        }:
-
-            self.events.end(
-                "SLEEP"
-            )
-
-            self.sit(
-                on_bed=True
-            )
-
+            state = self.patient.state
+        if state in {"sleeping", "lying"}:
+            self.events.end("SLEEP")
+            self.sit(on_bed=True)
         else:
-
-            self.sit(
-                on_bed=False
-            )
-
-        self.scenario_wait(
-            self.random_seconds(
-                120,
-                600
-            )
-        )
-
+            self.sit(on_bed=False)
+        self.scenario_wait(self.random_seconds(40, 130))
 
     def leave_room_action(self):
-
-        """
-        낮이면 일반 부재.
-        밤이고 최근 침대에서 나온 상태면
-        set_absent()가 NIGHT_EXIT를 자동 생성.
-        """
-
         period = day_period()
-
-        print(
-            f"[AUTO] 병실 밖으로 이동 "
-            f"(현재 구간={period})"
-        )
-
+        print(f"[AUTO] 병실 외출/재입실 ({period})")
         with self.state_lock:
-
-            state = (
-                self.patient.state
-            )
-
-        if state in {
-            "sleeping",
-            "lying",
-            "sitting"
-        }:
-
+            state = self.patient.state
+        if state in {"sleeping", "lying", "sitting"}:
             if not self.wake_up_sequence():
                 return
-
-        self.walk(
-            "door"
-        )
-
-        self.wait_for_state(
-            "standing",
-            timeout=30
-        )
-
+        self.walk("door")
+        if not self.wait_for_state("standing", timeout=30):
+            return
         if not self.auto_active():
             return
-
         self.set_absent()
-
-        # 밤에는 짧은 야간 이탈,
-        # 낮에는 외출/검사 등으로 더 길게
-        if is_night_time():
-
-            absence_seconds = (
-                self.random_seconds(
-                    120,
-                    600
-                )
-            )
-
-        else:
-
-            absence_seconds = (
-                self.random_seconds(
-                    300,
-                    1800
-                )
-            )
-
-        if not self.scenario_wait(
-            absence_seconds
-        ):
-
+        # Engine 부재 10초 확정 시간보다 충분히 길게 유지.
+        absence_seconds = self.random_seconds(35, 125) if is_night_time() else self.random_seconds(45, 180)
+        if not self.scenario_wait(absence_seconds):
             return
-
-        print(
-            "[AUTO] 병실 재입실"
-        )
-
+        print("[AUTO] 병실 재입실")
         self.enter_room()
-
-        # 입실 직후 잠깐 안정
-        self.scenario_wait(
-            self.random_seconds(
-                20,
-                120
-            )
-        )
-
+        self.scenario_wait(self.random_seconds(8, 24))
 
     def fall_action(self):
-
-        """
-        학습용 데이터 확보를 위해
-        실제 생활보다 자주 발생하도록 설정.
-        """
-
-        print(
-            "!!! [AUTO] FALL 의심 발생 !!!"
-        )
-
-        # 수면 중 바로 낙상은 만들지 않음
+        """매우 낮은 확률로만 낙상 후보 생성; 모의 환자 안전 검증용이 아님."""
+        print("!!! [AUTO] FALL 의심 (드문 합성 시나리오) !!!")
+        self.last_random_fall_at = datetime.now()
         with self.state_lock:
-
-            state = (
-                self.patient.state
-            )
-
-        if state in {
-            "sleeping",
-            "lying",
-            "sitting"
-        }:
-
+            state = self.patient.state
+        if state in {"sleeping", "lying", "sitting"}:
             if not self.wake_up_sequence():
                 return
-
-        # 낙상 전 짧은 이동을 넣는 경우가 많음
         if self.rng.random() < 0.65:
-
-            target = str(
-                self.rng.choice(
-                    [
-                        "center",
-                        "bathroom",
-                        "bed_side"
-                    ]
-                )
-            )
-
-            self.walk(
-                target
-            )
-
-            # 이동 도중 중간에 낙상하도록
-            self.scenario_wait(
-                self.random_seconds(
-                    0.5,
-                    2.5
-                )
-            )
-
+            target = str(self.rng.choice(["center", "bathroom", "bed_side"]))
+            self.walk(target)
+            if not self.scenario_wait(self.random_seconds(1.0, 2.2)):
+                return
         self.fall()
-
-        self.wait_for_state(
-            "fallen",
-            timeout=10
-        )
-
+        if not self.wait_for_state("fallen", timeout=10):
+            return
         if not self.auto_active():
             return
-
-        # 낙상 직후 미움직임
-        self.events.start(
-            "INACTIVITY",
-            "POST_FALL_INACTIVITY"
-        )
-
-        if not self.scenario_wait(
-            self.random_seconds(
-                30,
-                180
-            )
-        ):
-
+        # 낮은 자세 유지 3초 초과(낙상 판별용), 30분 미움직임과는 구분
+        if not self.scenario_wait(self.random_seconds(15, 45)):
             return
-
-        self.events.end(
-            "INACTIVITY"
-        )
-
-        print(
-            "[AUTO] 낙상 후 회복"
-        )
-
+        print("[AUTO] 낙상 후 회복")
         self.recover()
-
-        self.scenario_wait(
-            self.random_seconds(
-                30,
-                180
-            )
-        )
-
-
-    # ========================================================
-    # 시간대별 랜덤 행동 선택
-    # ========================================================
+        self.scenario_wait(self.random_seconds(15, 40))
 
     def choose_random_action(self):
-
+        """활동/외출/미움직임을 늘리고 낙상은 드물게 선택."""
+        # 처음 두 행동은 재실 이동과 외출/재입실: 시작하자마자 30분 정지하지 않음.
+        if self.auto_steps == 0:
+            return "walk"
+        if self.auto_steps == 1:
+            return "leave_room"
         period = day_period()
-
-        with self.state_lock:
-
-            state = (
-                self.patient.state
-            )
-
-        # --------------------------------------------
-        # 야간
-        # --------------------------------------------
-
         if period == "night":
-
-            actions = [
-                "sleep",
-                "bed_rest",
-                "bathroom",
-                "leave_room",
-                "inactivity",
-                "walk",
-                "fall",
-            ]
-
-            weights = np.array(
-                [
-                    0.48,
-                    0.16,
-                    0.12,
-                    0.08,
-                    0.08,
-                    0.06,
-                    FALL_WEIGHT_NIGHT,
-                ],
-                dtype=float
-            )
-
-        # --------------------------------------------
-        # 아침
-        # --------------------------------------------
-
-        elif period == "morning":
-
-            actions = [
-                "walk",
-                "bathroom",
-                "sit_rest",
-                "bed_rest",
-                "inactivity",
-                "leave_room",
-                "sleep",
-                "fall",
-            ]
-
-            weights = np.array(
-                [
-                    0.25,
-                    0.18,
-                    0.14,
-                    0.10,
-                    0.10,
-                    0.12,
-                    0.08,
-                    FALL_WEIGHT_DAY,
-                ],
-                dtype=float
-            )
-
-        # --------------------------------------------
-        # 낮
-        # --------------------------------------------
-
-        elif period == "day":
-
-            actions = [
-                "walk",
-                "bathroom",
-                "sit_rest",
-                "inactivity",
-                "leave_room",
-                "bed_rest",
-                "sleep",
-                "fall",
-            ]
-
-            weights = np.array(
-                [
-                    0.27,
-                    0.14,
-                    0.13,
-                    0.15,
-                    0.14,
-                    0.08,
-                    0.06,
-                    FALL_WEIGHT_DAY,
-                ],
-                dtype=float
-            )
-
-        # --------------------------------------------
-        # 저녁
-        # --------------------------------------------
-
+            weights = {
+                "walk": 0.24, "leave_room": 0.14,
+                "inactivity": 0.16, "bathroom": 0.12,
+                "sleep": 0.22, "bed_rest": 0.06,
+                "sit_rest": 0.06, "fall": FALL_WEIGHT_NIGHT,
+            }
         else:
-
-            actions = [
-                "bed_rest",
-                "walk",
-                "bathroom",
-                "sit_rest",
-                "inactivity",
-                "sleep",
-                "leave_room",
-                "fall",
-            ]
-
-            weights = np.array(
-                [
-                    0.22,
-                    0.17,
-                    0.13,
-                    0.12,
-                    0.12,
-                    0.16,
-                    0.05,
-                    FALL_WEIGHT_DAY,
-                ],
-                dtype=float
-            )
-
-        # 수면 상태인데 다시 sleep이 뽑혀도 자연스럽게 허용.
-        # 단 완전히 부재 상태는 자동 action 내부에서만 존재하도록 함.
-
-        weights = (
-            weights
-            / weights.sum()
-        )
-
-        return str(
-            self.rng.choice(
-                actions,
-                p=weights
-            )
-        )
-
+            weights = {
+                "walk": 0.36, "leave_room": 0.23,
+                "inactivity": 0.23, "bathroom": 0.08,
+                "sleep": 0.03, "bed_rest": 0.025,
+                "sit_rest": 0.045, "fall": FALL_WEIGHT_DAY,
+            }
+        # 최소 두 개의 다른 행동을 거친 뒤 다음 장시간 미움직임 허용.
+        if self.actions_since_inactivity < 2:
+            weights["inactivity"] = 0.0
+        elif self.actions_since_inactivity >= 6:
+            weights["inactivity"] *= 1.8
+        if (self.last_random_fall_at is not None and
+                (datetime.now() - self.last_random_fall_at).total_seconds() < FALL_COOLDOWN_SECONDS):
+            weights["fall"] = 0.0
+        actions = list(weights)
+        probabilities = np.array(list(weights.values()), dtype=float)
+        probabilities /= probabilities.sum()
+        return str(self.rng.choice(actions, p=probabilities))
 
     def execute_random_action(
         self,
         action
     ):
+
+        # 자동 실행 중단으로 외출 상태에서 멈췄다가 재시작했을 때
+        # 다음 행동을 PRESENT로 오인하지 않도록 입실 이벤트부터 기록.
+        with self.state_lock:
+            absent = not self.patient.presence
+        if absent:
+            self.enter_room()
 
         if action == "sleep":
 
@@ -2794,6 +2307,8 @@ class RadarSimulator:
             return
 
         self.auto_running = True
+        self.auto_steps = 0
+        self.actions_since_inactivity = 3
 
         if hours is None:
 
@@ -2872,6 +2387,11 @@ class RadarSimulator:
 
                 self.execute_random_action(
                     action
+                )
+                self.auto_steps += 1
+                self.actions_since_inactivity = (
+                    0 if action == "inactivity"
+                    else self.actions_since_inactivity + 1
                 )
 
                 if not self.auto_active():
