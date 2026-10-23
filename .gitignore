@@ -1,3 +1,9 @@
 .env
 __pycache__/
 *.pyc
+# Local sensor event previews (not for Git commits)
+logs/
+carewave_db_event_preview.json
+carewave_event_candidates_dryrun.json
+/data/failed_radar_frames.jsonl
+/python simulation/data/radar_frame.csv
